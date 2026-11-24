@@ -1,0 +1,139 @@
+"""Guard test for MCP workflow raw-HTTP route prefix choices.
+
+Keeps public vs internal route prefix assignments stable:
+- list / create / update / update_folder / retry → ``v1/workflows`` (public,
+  mirrors the Fern-generated raw client at ``skyvern/client/raw_client.py``).
+- get / run-status → ``api/v1/workflows`` (internal, used only where no public
+  Fern SDK equivalent exists yet).
+
+If you're adding a new MCP workflow raw helper and this test fails, either
+(a) your new helper uses the wrong prefix for its responsibility, or
+(b) this test needs a new assertion entry for the new helper.
+
+The Skyvern Cloud Fern SDK runbook gives the rationale behind the split.
+"""
+
+from __future__ import annotations
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from skyvern.cli.mcp_tools import _workflow_http
+from skyvern.cli.mcp_tools import workflow as workflow_tools
+from skyvern.client.errors import BadRequestError
+
+
+@pytest.fixture
+def capture_request(monkeypatch: pytest.MonkeyPatch) -> MagicMock:
+    """Replace httpx.request with a 200 response.
+
+    The default JSON payload is a dict for dict-returning helpers; list tests
+    override it to ``[]``.
+    """
+    response = MagicMock()
+    response.status_code = 200
+    response.json.return_value = {}
+
+    mock_skyvern = MagicMock()
+    mock_skyvern._client_wrapper = MagicMock()
+    mock_skyvern._client_wrapper.httpx_client = MagicMock()
+    mock_skyvern._client_wrapper.httpx_client.request = AsyncMock(return_value=response)
+
+    monkeypatch.setattr(_workflow_http, "get_skyvern", lambda: mock_skyvern)
+    return mock_skyvern._client_wrapper.httpx_client.request
+
+
+def _route(captured: MagicMock) -> str:
+    """Extract the route string passed as the first positional arg to httpx.request."""
+    assert captured.await_count == 1, "helper must make exactly one HTTP call"
+    return captured.call_args[0][0]
+
+
+@pytest.mark.asyncio
+async def test_list_workflows_uses_public_route(capture_request: MagicMock) -> None:
+    capture_request.return_value.json.return_value = []
+    await _workflow_http.list_workflows_raw(search=None, page=1, page_size=10, only_workflows=False)
+    assert _route(capture_request) == _workflow_http.PUBLIC_WORKFLOW_ROUTE
+
+
+@pytest.mark.asyncio
+async def test_create_workflow_uses_public_route(capture_request: MagicMock) -> None:
+    await _workflow_http.create_workflow_raw(
+        json_definition={"title": "x"},
+        yaml_definition=None,
+        folder_id=None,
+    )
+    assert _route(capture_request) == _workflow_http.PUBLIC_WORKFLOW_ROUTE
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_uses_public_route(capture_request: MagicMock) -> None:
+    await _workflow_http.update_workflow_raw(
+        "wpid_x",
+        json_definition={"title": "x"},
+        yaml_definition=None,
+    )
+    assert _route(capture_request).startswith(_workflow_http.PUBLIC_WORKFLOW_ROUTE + "/")
+
+
+@pytest.mark.asyncio
+async def test_update_workflow_folder_uses_public_route(capture_request: MagicMock) -> None:
+    await _workflow_http.update_workflow_folder_raw("wpid_x", folder_id=None)
+    assert _route(capture_request).startswith(_workflow_http.PUBLIC_WORKFLOW_ROUTE + "/")
+
+
+@pytest.mark.asyncio
+async def test_retry_workflow_run_uses_public_route(capture_request: MagicMock) -> None:
+    await _workflow_http.retry_workflow_run_raw("wr_x")
+    assert _route(capture_request).startswith(_workflow_http.PUBLIC_WORKFLOW_ROUTE + "/")
+
+
+@pytest.mark.asyncio
+async def test_retry_workflow_run_bad_request_uses_detail(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def raise_bad_request(workflow_run_id: str) -> dict[str, object]:
+        raise BadRequestError(body={"detail": f"Workflow run {workflow_run_id} is not terminal"})
+
+    monkeypatch.setattr(workflow_tools, "retry_workflow_run_raw", raise_bad_request)
+
+    result = await workflow_tools.skyvern_workflow_retry("wr_x")
+
+    assert result["ok"] is False
+    assert result["error"]["message"] == "Workflow run wr_x is not terminal"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("include_child_runs", "expected_param"), [(False, None), (True, True)])
+async def test_workflow_run_list_sends_include_child_runs_only_when_opted_in(
+    capture_request: MagicMock,
+    include_child_runs: bool,
+    expected_param: bool | None,
+) -> None:
+    """The public route hides child runs unless asked, so the opt-in has to survive the whole
+    tool -> raw-helper -> query-string path."""
+    capture_request.return_value.json.return_value = []
+
+    result = await workflow_tools.skyvern_workflow_run_list("wpid_x", include_child_runs=include_child_runs)
+
+    assert result["ok"] is True
+    assert capture_request.call_args.kwargs["params"].get("include_child_runs") == expected_param
+
+
+@pytest.mark.asyncio
+async def test_retry_workflow_run_rejects_task_run_ids() -> None:
+    result = await workflow_tools.skyvern_workflow_retry("tsk_v2_x")
+
+    assert result["ok"] is False
+    assert result["error"]["message"] == "Invalid workflow_run_id format: 'tsk_v2_x'"
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_by_id_uses_internal_route(capture_request: MagicMock) -> None:
+    await _workflow_http.get_workflow_by_id("wpid_x")
+    assert _route(capture_request).startswith(_workflow_http.INTERNAL_WORKFLOW_ROUTE + "/")
+
+
+@pytest.mark.asyncio
+async def test_get_workflow_run_status_uses_internal_route(capture_request: MagicMock) -> None:
+    await _workflow_http.get_workflow_run_status("wr_x", include_output_details=False)
+    assert _route(capture_request).startswith(_workflow_http.INTERNAL_WORKFLOW_ROUTE + "/")

@@ -1,0 +1,384 @@
+"""Tests for the @db_operation decorator."""
+
+import asyncio
+from unittest.mock import ANY, patch
+
+import anyio
+import pytest
+from sqlalchemy.exc import OperationalError, ProgrammingError, SQLAlchemyError
+
+from skyvern.forge.sdk.db._error_handling import db_operation
+from skyvern.forge.sdk.db.exceptions import NotFoundError
+from tests.unit.statement_timeout_fakes import statement_timeout_error
+
+
+class FakeDB:
+    """Fake DB class to test the decorator on methods."""
+
+    @db_operation("get_item")
+    async def get_item(self, item_id: str) -> str:
+        return f"item-{item_id}"
+
+    @db_operation("create_item")
+    async def create_item(self, name: str, value: int) -> dict:
+        return {"name": name, "value": value}
+
+    @db_operation("raise_not_found")
+    async def raise_not_found(self) -> None:
+        raise NotFoundError("item not found")
+
+    @db_operation("raise_sqlalchemy")
+    async def raise_sqlalchemy(self) -> None:
+        raise SQLAlchemyError("db connection failed")
+
+    @db_operation("raise_generic")
+    async def raise_generic(self) -> None:
+        raise RuntimeError("something unexpected")
+
+
+@pytest.mark.asyncio
+async def test_db_operation_returns_value() -> None:
+    """Decorator should pass through the return value on success."""
+    db = FakeDB()
+    result = await db.get_item("123")
+    assert result == "item-123"
+
+
+@pytest.mark.asyncio
+async def test_db_operation_passes_args() -> None:
+    """Decorator should forward all args and kwargs correctly."""
+    db = FakeDB()
+    result = await db.create_item("test", value=42)
+    assert result == {"name": "test", "value": 42}
+
+
+@pytest.mark.asyncio
+async def test_db_operation_logs_and_reraises_not_found() -> None:
+    """NotFoundError should be logged at debug level and re-raised."""
+    db = FakeDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(NotFoundError, match="item not found"):
+            await db.raise_not_found()
+        mock_log.warning.assert_called_once_with("BusinessLogicError", operation="raise_not_found", exc_info=True)
+
+
+@pytest.mark.asyncio
+async def test_db_operation_logs_and_reraises_sqlalchemy_error() -> None:
+    """SQLAlchemyError should be logged and re-raised."""
+    db = FakeDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(SQLAlchemyError, match="db connection failed"):
+            await db.raise_sqlalchemy()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="raise_sqlalchemy")
+
+
+@pytest.mark.asyncio
+async def test_db_operation_logs_and_reraises_generic_exception() -> None:
+    """Generic exceptions should be logged and re-raised."""
+    db = FakeDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(RuntimeError, match="something unexpected"):
+            await db.raise_generic()
+        mock_log.exception.assert_called_once_with("UnexpectedError", operation="raise_generic")
+
+
+@pytest.mark.asyncio
+async def test_db_operation_preserves_function_name() -> None:
+    """Decorator should preserve __name__ via functools.wraps."""
+    db = FakeDB()
+    assert db.get_item.__name__ == "get_item"
+    assert db.create_item.__name__ == "create_item"
+
+
+@pytest.mark.asyncio
+async def test_db_operation_preserves_docstring() -> None:
+    """Decorator should preserve __doc__ via functools.wraps."""
+
+    class DocDB:
+        @db_operation("documented_method")
+        async def documented_method(self) -> str:
+            """This method has a docstring."""
+            return "ok"
+
+    db = DocDB()
+    assert db.documented_method.__doc__ == "This method has a docstring."
+
+
+@pytest.mark.asyncio
+async def test_db_operation_on_standalone_function() -> None:
+    """Decorator should also work on standalone async functions, not just methods."""
+
+    @db_operation("standalone")
+    async def standalone(x: int, y: int) -> int:
+        return x + y
+
+    result = await standalone(3, 4)
+    assert result == 7
+
+
+@pytest.mark.asyncio
+async def test_db_operation_not_found_subclass_reraises() -> None:
+    """Subclasses of NotFoundError should also be logged and re-raised."""
+
+    class SpecificNotFound(NotFoundError):
+        pass
+
+    class SubDB:
+        @db_operation("subclass_not_found")
+        async def subclass_not_found(self) -> None:
+            raise SpecificNotFound("specific not found")
+
+    db = SubDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(SpecificNotFound, match="specific not found"):
+            await db.subclass_not_found()
+        mock_log.warning.assert_called_once_with("BusinessLogicError", operation="subclass_not_found", exc_info=True)
+
+
+def test_db_operation_rejects_sync_function() -> None:
+    """Decorator should raise TypeError when applied to a sync function."""
+    with pytest.raises(TypeError, match="requires an async function"):
+
+        @db_operation("sync_op")
+        def sync_func() -> str:
+            return "not async"
+
+
+@pytest.mark.asyncio
+async def test_db_operation_sqlalchemy_subclass_logged_and_reraised() -> None:
+    """Subclasses of SQLAlchemyError should be caught, logged, and re-raised."""
+    from sqlalchemy.exc import IntegrityError
+
+    class IntegrityDB:
+        @db_operation("integrity_error")
+        async def integrity_error(self) -> None:
+            raise IntegrityError("duplicate key", params=None, orig=Exception("dup"))
+
+    db = IntegrityDB()
+    with pytest.raises(IntegrityError):
+        await db.integrity_error()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_log_errors_false_suppresses_logging() -> None:
+    """When log_errors=False, errors should still be re-raised but not logged."""
+
+    class SilentDB:
+        @db_operation("silent_op", log_errors=False)
+        async def raise_sqlalchemy(self) -> None:
+            raise SQLAlchemyError("silent error")
+
+    db = SilentDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(SQLAlchemyError, match="silent error"):
+            await db.raise_sqlalchemy()
+        mock_log.warning.assert_not_called()
+        mock_log.error.assert_not_called()
+        mock_log.exception.assert_not_called()
+
+
+class _ExpectedErrorDB:
+    """Declares one condition its callers handle themselves; everything else stays loud."""
+
+    @db_operation("declared_op", expected_errors=(ProgrammingError,))
+    async def raise_declared(self) -> None:
+        raise ProgrammingError("SELECT 1", {}, Exception("relation does not exist"))
+
+    @db_operation("declared_op", expected_errors=(ProgrammingError,))
+    async def raise_undeclared(self) -> None:
+        raise OperationalError("SELECT 1", {}, Exception("connection does not exist"))
+
+
+@pytest.mark.asyncio
+async def test_db_operation_declared_expected_error_logs_debug_not_error() -> None:
+    db = _ExpectedErrorDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(ProgrammingError):
+            await db.raise_declared()
+        mock_log.debug.assert_called_once_with(
+            "ExpectedError",
+            operation="declared_op",
+            error=ANY,
+            error_type="ProgrammingError",
+        )
+        mock_log.exception.assert_not_called()
+        mock_log.error.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_undeclared_error_still_logs_exception() -> None:
+    """Declaring one expected condition must not quiet the rest of the operation's failures."""
+    db = _ExpectedErrorDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_undeclared()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="declared_op")
+        mock_log.debug.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_declares_nothing_expected_by_default() -> None:
+    """Operations that don't opt in keep logging every failure at error level."""
+
+    class DefaultDB:
+        @db_operation("default_op")
+        async def raise_programming(self) -> None:
+            raise ProgrammingError("SELECT 1", {}, Exception("relation does not exist"))
+
+    db = DefaultDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(ProgrammingError):
+            await db.raise_programming()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="default_op")
+        mock_log.debug.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_expected_error_still_reraises_unchanged() -> None:
+    """Callers degrade by catching the exception, so the instance must arrive untouched."""
+    raised = ProgrammingError("SELECT 1", {}, Exception("relation does not exist"))
+
+    class ReraiseDB:
+        @db_operation("reraise_op", expected_errors=(ProgrammingError,))
+        async def raise_declared(self) -> None:
+            raise raised
+
+    with pytest.raises(ProgrammingError) as caught:
+        await ReraiseDB().raise_declared()
+    assert caught.value is raised
+
+
+class _StatementTimeoutDB:
+    """One operation whose callers handle a cancellation themselves; the rest stay loud."""
+
+    @db_operation("handled_timeout_op", warn_on_statement_timeout=True)
+    async def raise_cancellation(self) -> None:
+        raise statement_timeout_error()
+
+    @db_operation("handled_timeout_op", warn_on_statement_timeout=True)
+    async def raise_other_operational_error(self) -> None:
+        raise OperationalError("SELECT 1", {}, Exception("connection does not exist"))
+
+    @db_operation("loud_timeout_op")
+    async def raise_cancellation_without_opt_in(self) -> None:
+        raise statement_timeout_error()
+
+
+@pytest.mark.asyncio
+async def test_warn_on_statement_timeout_keeps_the_event_name_and_drops_the_error_level() -> None:
+    # The production monitor keys on the "SQLAlchemyError" message with no status filter, so the
+    # name has to survive the level change for its count to stay the same.
+    db = _StatementTimeoutDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_cancellation()
+        mock_log.warning.assert_called_once_with("SQLAlchemyError", operation="handled_timeout_op", exc_info=True)
+        mock_log.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_warn_on_statement_timeout_leaves_a_real_outage_at_error() -> None:
+    """The opt-in must not quiet the rest of the operation's failures: OperationalError is wider."""
+    db = _StatementTimeoutDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_other_operational_error()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="handled_timeout_op")
+        mock_log.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_statement_timeout_stays_at_error_without_the_opt_in() -> None:
+    """Operations whose callers do not handle a cancellation keep asking for action."""
+    db = _StatementTimeoutDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(OperationalError):
+            await db.raise_cancellation_without_opt_in()
+        mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="loud_timeout_op")
+        mock_log.warning.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_db_operation_schedule_limit_exceeded_is_passthrough() -> None:
+    """ScheduleLimitExceededError should be treated as business logic, not unexpected."""
+    from skyvern.forge.sdk.db.exceptions import ScheduleLimitExceededError
+
+    class ScheduleDB:
+        @db_operation("create_schedule")
+        async def create_schedule(self) -> None:
+            raise ScheduleLimitExceededError("org1", 5, 5)
+
+    db = ScheduleDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with pytest.raises(ScheduleLimitExceededError):
+            await db.create_schedule()
+        mock_log.warning.assert_called_once_with("BusinessLogicError", operation="create_schedule", exc_info=True)
+        mock_log.exception.assert_not_called()
+
+
+class _CancelledPingDB:
+    # Mirrors SQLAlchemy's psycopg do_ping: the cancelled SELECT 1 leaves the connection ACTIVE, and the
+    # autocommit restore in its `finally` raises ProgrammingError over the CancelledError.
+    @db_operation("get_tasks")
+    async def get_tasks(self) -> None:
+        try:
+            await asyncio.Event().wait()
+        finally:
+            raise ProgrammingError(
+                "SELECT 1", None, Exception("can't change 'autocommit' now: connection in transaction status ACTIVE")
+            )
+
+
+@pytest.mark.asyncio
+async def test_db_error_masking_a_cancellation_propagates_as_the_cancellation() -> None:
+    """A client disconnect cancels a streaming body through an anyio scope; it must not surface as a DB error."""
+    db = _CancelledPingDB()
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        with anyio.CancelScope() as scope:
+            asyncio.get_running_loop().call_soon(scope.cancel)
+            await db.get_tasks()
+        assert scope.cancelled_caught
+        mock_log.exception.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_stale_request_cancellation_does_not_mask_a_later_database_error() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    task.cancel()
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+        child = asyncio.create_task(asyncio.sleep(0))
+        child.cancel()
+        error = ProgrammingError("SELECT 1", None, Exception("database cleanup failed"))
+
+        @db_operation("child_cancel")
+        async def operation() -> None:
+            try:
+                await child
+            finally:
+                raise error
+
+        with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+            with pytest.raises(ProgrammingError) as caught:
+                await operation()
+            assert caught.value is error
+            assert error.hide_parameters
+            mock_log.exception.assert_called_once_with("SQLAlchemyError", operation="child_cancel")
+    finally:
+        task.uncancel()
+
+
+@pytest.mark.asyncio
+async def test_request_cancelled_before_database_call_still_propagates_cancellation() -> None:
+    task = asyncio.current_task()
+    assert task is not None
+    with patch("skyvern.forge.sdk.db._error_handling.LOG") as mock_log:
+        task.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await _CancelledPingDB().get_tasks()
+            mock_log.exception.assert_not_called()
+        finally:
+            task.uncancel()
