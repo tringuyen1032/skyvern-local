@@ -5,8 +5,9 @@ the captcha and bot-protection arms that the open build leaves to a person are s
 of waited out.
 
 Everything else — CLI, server, workflows, agent, browser factory, the frontend — is upstream code.
-This is not a fork on GitHub; it is a standalone copy with the changes committed on top, so `git log`
-reads as upstream history followed by the local commits.
+This is not a fork on GitHub; it is a standalone copy. The base clone was shallow, so the history
+here is a single root commit holding the whole tree: the changes are described below and in
+`local/challenge-kit/`, which also carries the patch, installer and tests.
 
 Upstream: [Skyvern-AI/skyvern](https://github.com/Skyvern-AI/skyvern). Licence: AGPL-3.0 (`LICENSE`,
 unchanged).
